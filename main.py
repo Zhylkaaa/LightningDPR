@@ -1,5 +1,6 @@
 from argparse import ArgumentParser, Namespace
-from typing import Any, Tuple, List, Optional
+from typing import Any, Tuple, List, Optional, Dict
+from pathlib import Path
 import pytorch_lightning as pl
 import torch
 from torch import nn, Tensor
@@ -19,6 +20,8 @@ from utils import (
     init_dpr_component_from_pretrained_model
 )
 from data_module import DPRDatasetModule
+from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 
 
 class DPRModel(pl.LightningModule):
@@ -37,6 +40,10 @@ class DPRModel(pl.LightningModule):
         self.q_tokenizer = q_tokenizer
         self.ctx_encoder = ctx_encoder
         self.ctx_tokenizer = ctx_tokenizer
+        self.avg_train_num_correct = -1
+        self.avg_train_loss = 0
+        self.step = 0
+        self.output_dir = Path(self.hparams.output_dir)
 
     def forward(self, *args, **kwargs) -> Tuple[Tensor, Tensor]:
         pass
@@ -61,7 +68,7 @@ class DPRModel(pl.LightningModule):
         ).sum()
         return loss, correct_predictions_count
 
-    def training_step(self, question_input, ctx_input, positive_context_ids, is_valid):
+    def _produce_question_ctx_vectors(self, question_input, ctx_input, positive_context_ids, is_valid):
         local_question_vectors = self.q_encoder(**question_input)[0]
         local_ctx_vectors = self.ctx_encoder(**ctx_input)[0]
 
@@ -86,24 +93,62 @@ class DPRModel(pl.LightningModule):
         global_ctx_vectors = global_ctx_vectors[is_valid]
         positive_context_ids = positive_context_ids.view(-1)
 
+        return global_question_vectors, global_ctx_vectors, positive_context_ids
+
+    def training_step(self, question_input, ctx_input, positive_context_ids, is_valid):
+        global_question_vectors, global_ctx_vectors, positive_context_ids = \
+            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
+
         loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
-        self.log_dict({
-            'train_loss': loss,
-            'train_num_correct': num_correct
-        })
+        if self.avg_train_num_correct == -1:
+            self.avg_train_num_correct = num_correct
+            self.avg_train_loss = loss
+        else:
+            self.avg_train_num_correct = 0.9 * self.avg_train_num_correct + 0.1 * num_correct
+            self.avg_train_loss = 0.9 * self.avg_train_loss + 0.1 * loss
+
+        self.step += 1
+        if self.step % self.hparams.log_steps:
+            self.log_dict({
+                'avg_train_loss': self.avg_train_loss,
+                'train_num_correct_avg': self.avg_train_num_correct,
+                'global_step': self.step
+            })
         return loss
 
-    def validation_step(self, *args, **kwargs) -> Optional[STEP_OUTPUT]:
-        pass
+    def validation_step(self, question_input, ctx_input, positive_context_ids, is_valid) -> Tuple[Tensor, Tensor]:
+        global_question_vectors, global_ctx_vectors, positive_context_ids = \
+            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
 
-    def validation_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
-        pass
+        loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
+        return loss, num_correct
 
-    def test_step(self, *args, **kwargs) -> Optional[STEP_OUTPUT]:
-        pass
+    def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
+        losses, num_correct = list(zip(*outputs))
+        loss = torch.mean(losses).detach().cpu()
+        num_correct = torch.sum(num_correct).detach().cpu()
 
-    def test_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
-        pass
+        self.log_dict({
+            'val_loss': loss,
+            'val_num_correct': num_correct
+        })
+
+    def test_step(self, question_input, ctx_input, positive_context_ids, is_valid) -> Tuple[Tensor, Tensor]:
+        global_question_vectors, global_ctx_vectors, positive_context_ids = \
+            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
+
+        loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
+        return loss, num_correct
+
+    def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
+        losses, num_correct = list(zip(*outputs))
+        loss = torch.mean(losses).detach().cpu()
+        num_correct = torch.sum(num_correct).detach().cpu()
+
+        self.log_dict({
+            'test_loss': loss,
+            'test_num_correct': num_correct
+        })
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage != 'fit':
@@ -141,15 +186,25 @@ class DPRModel(pl.LightningModule):
             },
         }
 
+    @pl.utilities.rank_zero_only
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        base_save_path = self.output_dir.joinpath("checkpoint{}".format(self.step_count))
+        self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
+        self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
+
+        self.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
+        self.ctx_tokenizer.save_pretrained(base_save_path.joinpath('context_encoder'))
+
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group('DPRModel Params')
-        parser.add_argument("--weight_decay", default=0.0, type=float, help='Weight decay if we apply some.')
+        parser.add_argument('--weight_decay', default=0.0, type=float, help='Weight decay if we apply some.')
         parser.add_argument('--adam_epsilon', default=1e-8, type=float, help='Adam epsilon')
         parser.add_argument('--warmup_steps', default=0, type=int, help='Linear warmup over warmup_steps.')
-        parser.add_argument("--num_train_epochs", dest="max_epochs", default=1, type=int)
-        parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
-
+        parser.add_argument('--num_train_epochs', dest="max_epochs", default=1, type=int)
+        parser.add_argument('--learning_rate', default=5e-5, type=float, help="The initial learning rate for Adam.")
+        parser.add_argument('--log_steps', default=50, type=int, help='number of steps before ')
+        parser.add_argument('--output_dir', default='dpr_model', type=str)
 
 if __name__ == '__main__':
     parser = ArgumentParser()

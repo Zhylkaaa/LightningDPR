@@ -64,7 +64,7 @@ class DPRQuestionEncoder(DPREncoderPreTrainedModel):
 
     def forward(self,
                 input_ids,
-                attention_mask: Optional[Tensor],
+                attention_mask: Optional[Tensor] = None,
                 **kwargs):
         sequence_output, *other = self.encoder(
             input_ids=input_ids,

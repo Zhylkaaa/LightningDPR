@@ -13,6 +13,7 @@ python main.py \
 --train_batch_size 16 \
 --accumulate_grad_batches 1 \
 --eval_batch_size 32 \
+--val_check_interval 0.5 \
 --warmup_steps 100 \
 --num_train_epochs 20 \
 --learning_rate 3e-5 \
@@ -21,6 +22,7 @@ python main.py \
 --dev_data $DEV_DATA_FILE \
 --test_data $TEST_DATA_FILE \
 --gpus 2 \
+--accelerator ddp \
 --num_workers 1 \
 --num_negative_ctx 0 \
 --num_hard_negative_ctx 1 \

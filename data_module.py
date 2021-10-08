@@ -140,12 +140,12 @@ class DPRDatasetModule(pl.LightningDataModule):
             self,
             q_tokenizer: PreTrainedTokenizer,
             ctx_tokenizer: PreTrainedTokenizer,
-            hparams: Namespace,
+            args: Namespace,
     ):
         super(DPRDatasetModule, self).__init__()
+        self.args = args
         self.q_tokenizer = q_tokenizer
         self.ctx_tokenizer = ctx_tokenizer
-        self.hparams = hparams
         self.dataset: Dict[str, Optional[List]] = {
             'train': None,
             'dev': None,
@@ -153,11 +153,12 @@ class DPRDatasetModule(pl.LightningDataModule):
         }
 
     def setup(self, stage: Optional[str] = None) -> None:
-        for data_split, data_file in [('train', self.hparams.train_data),
-                                      ('dev', self.hparams.dev_data),
-                                      ('test', self.hparams.test_data)]:
+        for data_split, data_file in [('train', self.args.train_data),
+                                      ('dev', self.args.dev_data),
+                                      ('test', self.args.test_data)]:
             if data_file is not None:
-                data = json.load(data_file)
+                with open(data_file) as f:
+                    data = json.load(f)
                 filtered_data = [
                     d for d in data
                     if len(d['positive_ctxs']) > 0
@@ -165,11 +166,12 @@ class DPRDatasetModule(pl.LightningDataModule):
                 self.dataset[data_split] = filtered_data
 
     def prepare_data(self) -> None:
-        for data_split, data_file in [('train', self.hparams.train_data),
-                                      ('dev', self.hparams.dev_data),
-                                      ('test', self.hparams.test_data)]:
+        for data_split, data_file in [('train', self.args.train_data),
+                                      ('dev', self.args.dev_data),
+                                      ('test', self.args.test_data)]:
             if data_file is not None:
-                data = json.load(data_file)
+                with open(data_file) as f:
+                    data = json.load(f)
                 filtered_data = [
                     d for d in data
                     if len(d['positive_ctxs']) > 0
@@ -180,17 +182,17 @@ class DPRDatasetModule(pl.LightningDataModule):
         if self.dataset['train'] is None:
             return None
 
-        num_devices = max(1, self.hparams.gpus)
-        effective_batch_size = self.hparams.train_batch_size * num_devices * self.hparams.accumulate_grad_batches
-        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['train'], seed=self.hparams.seed,
+        num_devices = max(1, self.args.gpus)
+        effective_batch_size = self.args.train_batch_size * num_devices * self.args.accumulate_grad_batches
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['train'], seed=self.args.seed,
                                                       disjoint_window_size=effective_batch_size, resampling_count=100,
                                                       shuffle=True)
 
         return DataLoader(
             self.dataset['train'],
-            batch_size=self.hparams.train_batch_size,
+            batch_size=self.args.train_batch_size,
             sampler=sampler,
-            num_workers=self.hparams.num_workers,
+            num_workers=self.args.num_workers,
             collate_fn=lambda x: self.collator(x, sample=True)
         )
 
@@ -198,15 +200,15 @@ class DPRDatasetModule(pl.LightningDataModule):
         if self.dataset['dev'] is None:
             return None
 
-        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['dev'], seed=self.hparams.seed,
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['dev'], seed=self.args.seed,
                                                       disjoint_window_size=1,
                                                       shuffle=False)
 
         return DataLoader(
             self.dataset['dev'],
-            batch_size=self.hparams.eval_batch_size,
+            batch_size=self.args.eval_batch_size,
             sampler=sampler,
-            num_workers=self.hparams.num_workers,
+            num_workers=self.args.num_workers,
             collate_fn=lambda x: self.collator(x, sample=False)
         )
 
@@ -214,15 +216,15 @@ class DPRDatasetModule(pl.LightningDataModule):
         if self.dataset['test'] is None:
             return None
 
-        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['test'], seed=self.hparams.seed,
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['test'], seed=self.args.seed,
                                                       disjoint_window_size=1,
                                                       shuffle=False)
 
         return DataLoader(
             self.dataset['dev'],
-            batch_size=self.hparams.eval_batch_size,
+            batch_size=self.args.eval_batch_size,
             sampler=sampler,
-            num_workers=self.hparams.num_workers,
+            num_workers=self.args.num_workers,
             collate_fn=lambda x: self.collator(x, sample=False)
         )
 
@@ -236,7 +238,7 @@ class DPRDatasetModule(pl.LightningDataModule):
         for question_with_ctxs in questions_with_ctxs:
             batch_questions.append(question_with_ctxs['question'])
 
-            is_valid = [1 for _ in range(1 + self.hparams.num_negative_ctx + self.hparams.num_hard_negative_ctx)]
+            is_valid = [1 for _ in range(1 + self.args.num_negative_ctx + self.args.num_hard_negative_ctx)]
             positives = question_with_ctxs['positive_ctxs']
             negatives = question_with_ctxs['negative_ctxs']
             hard_negatives = question_with_ctxs['hard_negative_ctxs']
@@ -247,22 +249,22 @@ class DPRDatasetModule(pl.LightningDataModule):
 
             positive = positives[0]
 
-            negatives = negatives[:self.hparams.num_negative_ctx]
-            if len(negatives) < self.hparams.num_negative_ctx:
-                for i in range(1 + len(negatives), 1 + self.hparams.num_negative_ctx):
+            negatives = negatives[:self.args.num_negative_ctx]
+            if len(negatives) < self.args.num_negative_ctx:
+                for i in range(1 + len(negatives), 1 + self.args.num_negative_ctx):
                     is_valid[i] = 0
 
                 negatives += [{'title': pad_token, 'text': pad_token}
-                              for _ in range(self.hparams.num_negative_ctx - len(negatives))]
+                              for _ in range(self.args.num_negative_ctx - len(negatives))]
 
-            hard_negatives = hard_negatives[:self.hparams.num_hard_negative_ctx]
-            if len(hard_negatives) < self.hparams.num_hard_negative_ctx:
-                for i in range(1 + self.hparams.num_negative_ctx + len(hard_negatives),
-                               1 + self.hparams.num_negative_ctx + self.hparams.num_hard_negative_ctx):
+            hard_negatives = hard_negatives[:self.args.num_hard_negative_ctx]
+            if len(hard_negatives) < self.args.num_hard_negative_ctx:
+                for i in range(1 + self.args.num_negative_ctx + len(hard_negatives),
+                               1 + self.args.num_negative_ctx + self.args.num_hard_negative_ctx):
                     is_valid[i] = 0
 
                 hard_negatives += [{'title': pad_token, 'text': pad_token}
-                                   for _ in range(self.hparams.num_hard_negative_ctx - len(hard_negatives))]
+                                   for _ in range(self.args.num_hard_negative_ctx - len(hard_negatives))]
 
             positive_context_ids.append(len(batch_ctxs))
             batch_is_valid.extend(is_valid)
@@ -274,7 +276,7 @@ class DPRDatasetModule(pl.LightningDataModule):
 
         question_input = self.q_tokenizer.batch_encode_plus(
             batch_questions,
-            max_length=self.hparams.question_max_seq_len,
+            max_length=self.args.question_max_seq_len,
             truncation=True,
             padding='longest',
             return_tensors='pt'
@@ -282,10 +284,10 @@ class DPRDatasetModule(pl.LightningDataModule):
 
         ctx_input = self.ctx_tokenizer.batch_encode_plus(
             [f' {sep_token} '.join([ctx['title'], ctx['text']])
-             if self.hparams.insert_titles and not ctx['text'] == pad_token
+             if self.args.insert_titles and not ctx['text'] == pad_token
              else ctx['text']
              for ctx in batch_ctxs],
-            max_length=self.hparams.ctx_max_seq_len,
+            max_length=self.args.ctx_max_seq_len,
             truncation=True,
             padding='longest',
             return_tensors='pt'
@@ -308,8 +310,9 @@ class DPRDatasetModule(pl.LightningDataModule):
                             help='Number of negative contexts for each example')
         parser.add_argument('--num_hard_negative_ctx', default=1, type=int,
                             help='Number of hard negative contexts for each example')
-        parser.add_argument('--question_max_seq_len', default=256, help='Maximum number of tokens per question')
-        parser.add_argument('--ctx_max_seq_len', default=256,
+        parser.add_argument('--question_max_seq_len', default=256, type=int,
+                            help='Maximum number of tokens per question')
+        parser.add_argument('--ctx_max_seq_len', default=256, type=int,
                             help='Maximum number of tokens per context (title and text)')
         parser.add_argument('--insert_titles', action='store_true')
         return None

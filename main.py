@@ -33,7 +33,6 @@ class DPRModel(pl.LightningModule):
                  hparams: Namespace,
                  ):
         super().__init__()
-        self.hparams = hparams
         self.save_hyperparameters(hparams)
 
         self.q_encoder = q_encoder
@@ -67,7 +66,8 @@ class DPRModel(pl.LightningModule):
         ).sum()
         return loss, correct_predictions_count
 
-    def _produce_question_ctx_vectors(self, question_input, ctx_input, positive_context_ids, is_valid):
+    def _produce_question_ctx_vectors(self, question_input, ctx_input, positive_context_ids,
+                                      is_valid, sync_grads=False):
         local_question_vectors = self.q_encoder(**question_input)[0]
         local_ctx_vectors = self.ctx_encoder(**ctx_input)[0]
 
@@ -79,25 +79,26 @@ class DPRModel(pl.LightningModule):
             local_ctx_vectors,
             positive_context_ids,
             is_valid
-        ))
+        ), sync_grads=sync_grads)
 
         offset = 0
         for idx, valid in enumerate(is_valid):
-            positive_context_ids[idx] += offset
+            global_positive_context_ids[idx] += offset
             offset += torch.sum(valid)
 
         global_question_vectors = global_question_vectors.view(-1, global_question_vectors.shape[-1])
         global_ctx_vectors = global_ctx_vectors.view(-1, global_ctx_vectors.shape[-1])
         is_valid = is_valid.view(-1)
         global_ctx_vectors = global_ctx_vectors[is_valid]
-        positive_context_ids = positive_context_ids.view(-1)
+        global_positive_context_ids = global_positive_context_ids.view(-1)
 
-        return global_question_vectors, global_ctx_vectors, positive_context_ids
+        return global_question_vectors, global_ctx_vectors, global_positive_context_ids
 
     def training_step(self, batch, batch_idx):
         question_input, ctx_input, positive_context_ids, is_valid = batch
         global_question_vectors, global_ctx_vectors, positive_context_ids = \
-            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
+            self._produce_question_ctx_vectors(question_input, ctx_input,
+                                               positive_context_ids, is_valid, sync_grads=True)
 
         loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
         if self.avg_train_num_correct == -1:
@@ -115,7 +116,9 @@ class DPRModel(pl.LightningModule):
             })
         return loss
 
-    def validation_step(self, question_input, ctx_input, positive_context_ids, is_valid) -> Tuple[Tensor, Tensor]:
+    def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
+        question_input, ctx_input, positive_context_ids, is_valid = batch
+
         global_question_vectors, global_ctx_vectors, positive_context_ids = \
             self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
 
@@ -124,6 +127,9 @@ class DPRModel(pl.LightningModule):
 
     def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         losses, num_correct = list(zip(*outputs))
+        losses = torch.tensor(losses)
+        num_correct = torch.tensor(num_correct)
+
         loss = torch.mean(losses).detach().cpu()
         num_correct = torch.sum(num_correct).detach().cpu()
 
@@ -214,8 +220,8 @@ if __name__ == '__main__':
                                                                    'For more control use <question/context>_model_name_or_path')
     parser.add_argument('--question_model_name_or_path', default=None, help='Question encoder pretrained model')
     parser.add_argument('--context_model_name_or_path', default=None, help='Context encoder pretrained model')
-    parser.add_argument('--question_projection_dim', default=0, help='Question encoder projection dim')
-    parser.add_argument('--context_projection_dim', default=0, help='Context encoder projection dim')
+    parser.add_argument('--question_projection_dim', default=0, type=int, help='Question encoder projection dim')
+    parser.add_argument('--context_projection_dim', default=0, type=int, help='Context encoder projection dim')
     parser.add_argument('--seed', default=1, type=int, help='Seed for model and dataloaders')
     parser.add_argument('--fp16', action='store_true', help='Turn on AMP (adaptive mixed precision) training')
     parser.add_argument('--do_train', action='store_true', help='Whether to run training')
@@ -259,7 +265,7 @@ if __name__ == '__main__':
     if args.wandb_project is not None:
         wandb_logger = WandbLogger(project=args.wandb_project, log_model='all')
 
-    tensorboard_logger = TensorBoardLogger(seve_dir=args.tb_log_dir)
+    tensorboard_logger = TensorBoardLogger(save_dir=args.tb_log_dir)
 
     additional_args = {
         'precision': 16 if args.fp16 else 32,
@@ -285,7 +291,7 @@ if __name__ == '__main__':
     if wandb_logger:
         wandb_logger.watch(model)
 
-    dpr_datamodule = DPRDatasetModule(q_tokenizer=question_tokenizer, ctx_tokenizer=context_tokenizer, hparams=args)
+    dpr_datamodule = DPRDatasetModule(q_tokenizer=question_tokenizer, ctx_tokenizer=context_tokenizer, args=args)
     if args.do_train:
         trainer.fit(model, datamodule=dpr_datamodule)
 

@@ -1,0 +1,28 @@
+python main.py \
+--question_model_name_or_path allegro/herbert-base-cased \
+--context_model_name_or_path allegro/herbert-base-cased \
+--question_projection_dim 0 \
+--context_projection_dim 0 \
+--seed 42 \
+--fp16 \
+--do_train \
+--do_predict \
+--wandb_project train_dpr \
+--monitor_metric val_num_correct \
+--output_dir dpr_herbert_v1 \
+--train_batch_size 16 \
+--accumulate_grad_batches 1 \
+--eval_batch_size 32 \
+--warmup_steps 100 \
+--num_train_epochs 20 \
+--learning_rate 3e-5 \
+--log_every_n_steps 50 \
+--train_data $TRAIN_DATA_FILE \
+--dev_data $DEV_DATA_FILE \
+--test_data $TEST_DATA_FILE \
+--gpus 2 \
+--num_workers 1 \
+--num_negative_ctx 0 \
+--num_hard_negative_ctx 1 \
+--question_max_seq_len 128 \
+--ctx_max_seq_len 256

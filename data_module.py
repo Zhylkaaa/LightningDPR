@@ -285,7 +285,7 @@ class DPRDatasetModule(pl.LightningDataModule):
              if self.hparams.insert_titles and not ctx['text'] == pad_token
              else ctx['text']
              for ctx in batch_ctxs],
-            max_length=self.hparams.question_max_seq_len,
+            max_length=self.hparams.ctx_max_seq_len,
             truncation=True,
             padding='longest',
             return_tensors='pt'

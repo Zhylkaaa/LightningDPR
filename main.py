@@ -2,6 +2,7 @@ from argparse import ArgumentParser, Namespace
 from typing import Any, Tuple, List, Optional, Dict
 from pathlib import Path
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -20,8 +21,7 @@ from utils import (
     init_dpr_component_from_pretrained_model
 )
 from data_module import DPRDatasetModule
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
+from callbacks import get_default_callbacks
 
 
 class DPRModel(pl.LightningModule):
@@ -42,7 +42,6 @@ class DPRModel(pl.LightningModule):
         self.ctx_tokenizer = ctx_tokenizer
         self.avg_train_num_correct = -1
         self.avg_train_loss = 0
-        self.step = 0
         self.output_dir = Path(self.hparams.output_dir)
 
     def forward(self, *args, **kwargs) -> Tuple[Tensor, Tensor]:
@@ -95,7 +94,8 @@ class DPRModel(pl.LightningModule):
 
         return global_question_vectors, global_ctx_vectors, positive_context_ids
 
-    def training_step(self, question_input, ctx_input, positive_context_ids, is_valid):
+    def training_step(self, batch, batch_idx):
+        question_input, ctx_input, positive_context_ids, is_valid = batch
         global_question_vectors, global_ctx_vectors, positive_context_ids = \
             self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
 
@@ -107,12 +107,11 @@ class DPRModel(pl.LightningModule):
             self.avg_train_num_correct = 0.9 * self.avg_train_num_correct + 0.1 * num_correct
             self.avg_train_loss = 0.9 * self.avg_train_loss + 0.1 * loss
 
-        self.step += 1
-        if self.step % self.hparams.log_steps:
+        if self.global_step % self.hparams.log_every_n_steps:
             self.log_dict({
-                'avg_train_loss': self.avg_train_loss,
-                'train_num_correct_avg': self.avg_train_num_correct,
-                'global_step': self.step
+                'train_avg_loss': self.avg_train_loss,
+                'train_avg_num_correct': self.avg_train_num_correct,
+                'global_step': self.global_step
             })
         return loss
 
@@ -188,7 +187,7 @@ class DPRModel(pl.LightningModule):
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        base_save_path = self.output_dir.joinpath("checkpoint{}".format(self.step_count))
+        base_save_path = self.output_dir.joinpath(f'checkpoint-{self.current_epoch}-{self.global_step}')
         self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
         self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
 
@@ -203,8 +202,8 @@ class DPRModel(pl.LightningModule):
         parser.add_argument('--warmup_steps', default=0, type=int, help='Linear warmup over warmup_steps.')
         parser.add_argument('--num_train_epochs', dest="max_epochs", default=1, type=int)
         parser.add_argument('--learning_rate', default=5e-5, type=float, help="The initial learning rate for Adam.")
-        parser.add_argument('--log_steps', default=50, type=int, help='number of steps before ')
         parser.add_argument('--output_dir', default='dpr_model', type=str)
+
 
 if __name__ == '__main__':
     parser = ArgumentParser()
@@ -218,7 +217,12 @@ if __name__ == '__main__':
     parser.add_argument('--question_projection_dim', default=0, help='Question encoder projection dim')
     parser.add_argument('--context_projection_dim', default=0, help='Context encoder projection dim')
     parser.add_argument('--seed', default=1, type=int, help='Seed for model and dataloaders')
-    parser.add_argument('--nofp16', action='store_true', help='Turn off AMP')
+    parser.add_argument('--fp16', action='store_true', help='Turn on AMP (adaptive mixed precision) training')
+    parser.add_argument('--do_train', action='store_true', help='Whether to run training')
+    parser.add_argument('--do_predict', action='store_true', help='Whether to run prediction on test set')
+    parser.add_argument('--tb_log_dir', default='dpr_experiment', help='Tensorboard log dir')
+    parser.add_argument('--wandb_project', default=None, help='Wandb project to log to')
+    parser.add_argument('--monitor_metric', default='val_num_correct')
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -249,4 +253,41 @@ if __name__ == '__main__':
         projection_dim=args.context_projection_dim
     )
 
-    # TODO
+    callbacks = get_default_callbacks(args)
+
+    wandb_logger = None
+    if args.wandb_project is not None:
+        wandb_logger = WandbLogger(project=args.wandb_project, log_model='all')
+
+    tensorboard_logger = TensorBoardLogger(seve_dir=args.tb_log_dir)
+
+    additional_args = {
+        'precision': 16 if args.fp16 else 32,
+        'amp_backend': 'native',
+        'replace_sampler_ddp': False,
+        'callbacks': callbacks,
+        'logger': [tensorboard_logger, wandb_logger] if wandb_logger else tensorboard_logger
+    }
+
+    model = DPRModel(
+        q_encoder=question_model,
+        q_tokenizer=question_tokenizer,
+        ctx_encoder=context_model,
+        ctx_tokenizer=context_tokenizer,
+        hparams=args
+    )
+
+    trainer = pl.Trainer.from_argparse_args(
+        args,
+        **additional_args,
+    )
+
+    if wandb_logger:
+        wandb_logger.watch(model)
+
+    dpr_datamodule = DPRDatasetModule(q_tokenizer=question_tokenizer, ctx_tokenizer=context_tokenizer, hparams=args)
+    if args.do_train:
+        trainer.fit(model, datamodule=dpr_datamodule)
+
+    if args.do_predict:
+        trainer.test(model, datamodule=dpr_datamodule)

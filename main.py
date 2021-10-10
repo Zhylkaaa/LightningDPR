@@ -146,7 +146,8 @@ class DPRModel(pl.LightningModule):
             'val_num_correct': num_correct
         })
 
-    def test_step(self, question_input, ctx_input, positive_context_ids, is_valid) -> Tuple[Tensor, Tensor]:
+    def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
+        question_input, ctx_input, positive_context_ids, is_valid = batch
         global_question_vectors, global_ctx_vectors, positive_context_ids = \
             self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
 

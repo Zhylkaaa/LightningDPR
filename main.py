@@ -88,9 +88,12 @@ class DPRModel(pl.LightningModule):
             is_valid
          ), sync_grads=sync_grads)
 
+        global_question_vectors[self.global_rank] = local_question_vectors
+        global_ctx_vectors[self.global_rank] = local_ctx_vectors
+
         offset = 0
         shifted_positive_ids = []
-        for valid, positive_context_ids in zip(is_valid, global_positive_context_ids):
+        for idx, (valid, positive_context_ids) in enumerate(zip(is_valid, global_positive_context_ids)):
             shifted_positive_ids.extend([int(sum(valid[:idx]) + offset) for idx in positive_context_ids])
             offset += int(sum(valid))
 

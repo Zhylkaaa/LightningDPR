@@ -184,10 +184,12 @@ class DPRDatasetModule(pl.LightningDataModule):
 
         num_devices = max(1, self.args.gpus)
         effective_batch_size = self.args.train_batch_size * num_devices * self.args.accumulate_grad_batches
-        sampler = None
+
         # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['train'], seed=self.args.seed,
         #                                               disjoint_window_size=effective_batch_size, resampling_count=100,
         #                                               shuffle=True)
+
+        sampler = None
 
         return DataLoader(
             self.dataset['train'],
@@ -200,11 +202,11 @@ class DPRDatasetModule(pl.LightningDataModule):
     def val_dataloader(self) -> Union[DataLoader, List[DataLoader]]:
         if self.dataset['dev'] is None:
             return None
-        sampler = None
+
         # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['dev'], seed=self.args.seed,
         #                                               disjoint_window_size=1,
         #                                               shuffle=False)
-
+        sampler = None
         return DataLoader(
             self.dataset['dev'],
             batch_size=self.args.eval_batch_size,
@@ -216,11 +218,11 @@ class DPRDatasetModule(pl.LightningDataModule):
     def test_dataloader(self) -> Union[DataLoader, List[DataLoader]]:
         if self.dataset['test'] is None:
             return None
-        sampler = None
+
         # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['test'], seed=self.args.seed,
         #                                               disjoint_window_size=1,
         #                                               shuffle=False)
-
+        sampler = None
         return DataLoader(
             self.dataset['dev'],
             batch_size=self.args.eval_batch_size,

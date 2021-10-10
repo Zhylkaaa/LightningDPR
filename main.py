@@ -26,22 +26,29 @@ from callbacks import get_default_callbacks
 
 class DPRModel(pl.LightningModule):
     def __init__(self,
-                 q_encoder: PreTrainedModel,
-                 q_tokenizer: PreTrainedTokenizer,
-                 ctx_encoder: PreTrainedModel,
-                 ctx_tokenizer: PreTrainedTokenizer,
+                 question_model_name_or_path: str,
+                 question_projection_dim: int,
+                 context_model_name_or_path: str,
+                 context_projection_dim: int,
                  hparams: Namespace,
                  ):
         super().__init__()
         self.save_hyperparameters(hparams)
 
-        self.q_encoder = q_encoder
-        self.q_tokenizer = q_tokenizer
-        self.ctx_encoder = ctx_encoder
-        self.ctx_tokenizer = ctx_tokenizer
         self.avg_train_num_correct = -1
         self.avg_train_loss = 0
         self.output_dir = Path(self.hparams.output_dir)
+        self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
+            model_name_or_path=question_model_name_or_path,
+            component_class=DPRQuestionEncoder,
+            projection_dim=question_projection_dim
+        )
+
+        self.ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
+            model_name_or_path=context_model_name_or_path,
+            component_class=DPRContextEncoder,
+            projection_dim=context_projection_dim
+        )
 
     def forward(self, *args, **kwargs) -> Tuple[Tensor, Tensor]:
         pass
@@ -79,18 +86,19 @@ class DPRModel(pl.LightningModule):
             local_ctx_vectors,
             positive_context_ids,
             is_valid
-        ), sync_grads=sync_grads)
+         ), sync_grads=sync_grads)
 
         offset = 0
-        for idx, valid in enumerate(is_valid):
-            global_positive_context_ids[idx] += offset
-            offset += torch.sum(valid)
+        shifted_positive_ids = []
+        for valid, positive_context_ids in zip(is_valid, global_positive_context_ids):
+            shifted_positive_ids.extend([int(sum(valid[:idx]) + offset) for idx in positive_context_ids])
+            offset += int(sum(valid))
 
         global_question_vectors = global_question_vectors.view(-1, global_question_vectors.shape[-1])
         global_ctx_vectors = global_ctx_vectors.view(-1, global_ctx_vectors.shape[-1])
         is_valid = is_valid.view(-1)
         global_ctx_vectors = global_ctx_vectors[is_valid]
-        global_positive_context_ids = global_positive_context_ids.view(-1)
+        global_positive_context_ids = torch.tensor(shifted_positive_ids, dtype=torch.long)
 
         return global_question_vectors, global_ctx_vectors, global_positive_context_ids
 
@@ -247,18 +255,6 @@ if __name__ == '__main__':
         raise ValueError('Please specify model_name_or_path or '
                          'question_model_name_or_path with context_model_name_or_path')
 
-    question_model, question_tokenizer = init_dpr_component_from_pretrained_model(
-        model_name_or_path=question_model_name_or_path,
-        component_class=DPRQuestionEncoder,
-        projection_dim=args.question_projection_dim
-    )
-
-    context_model, context_tokenizer = init_dpr_component_from_pretrained_model(
-        model_name_or_path=context_model_name_or_path,
-        component_class=DPRContextEncoder,
-        projection_dim=args.context_projection_dim
-    )
-
     callbacks = get_default_callbacks(args)
 
     wandb_logger = None
@@ -270,16 +266,16 @@ if __name__ == '__main__':
     additional_args = {
         'precision': 16 if args.fp16 else 32,
         'amp_backend': 'native',
-        'replace_sampler_ddp': False,
+        'replace_sampler_ddp': True,
         'callbacks': callbacks,
         'logger': [tensorboard_logger, wandb_logger] if wandb_logger else tensorboard_logger
     }
 
     model = DPRModel(
-        q_encoder=question_model,
-        q_tokenizer=question_tokenizer,
-        ctx_encoder=context_model,
-        ctx_tokenizer=context_tokenizer,
+        question_model_name_or_path=question_model_name_or_path,
+        question_projection_dim=args.question_projection_dim,
+        context_model_name_or_path=context_model_name_or_path,
+        context_projection_dim=args.context_projection_dim,
         hparams=args
     )
 
@@ -291,7 +287,7 @@ if __name__ == '__main__':
     if wandb_logger:
         wandb_logger.watch(model)
 
-    dpr_datamodule = DPRDatasetModule(q_tokenizer=question_tokenizer, ctx_tokenizer=context_tokenizer, args=args)
+    dpr_datamodule = DPRDatasetModule(q_tokenizer=model.q_tokenizer, ctx_tokenizer=model.q_tokenizer, args=args)
     if args.do_train:
         trainer.fit(model, datamodule=dpr_datamodule)
 

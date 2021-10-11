@@ -1,27 +1,82 @@
 from argparse import ArgumentParser, Namespace
-from typing import Any, Tuple, List, Optional, Dict
 from pathlib import Path
+from typing import Any, Tuple, Optional, Dict
+
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 import torch
-from torch import nn, Tensor
 import torch.nn.functional as F
-from dpr_model import DPRContextEncoder, DPRQuestionEncoder
-from dpr_config import DPRConfig
+import torch.distributed
+from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
+from torch import Tensor
 from transformers import (
-    AutoModel,
-    AutoTokenizer,
-    AutoConfig,
-    PreTrainedModel,
-    PreTrainedTokenizer,
     get_linear_schedule_with_warmup,
     AdamW,
 )
+
+from callbacks import get_default_callbacks
+from data_module import DPRDatasetModule
+from dpr_model import DPRContextEncoder, DPRQuestionEncoder
 from utils import (
     init_dpr_component_from_pretrained_model
 )
-from data_module import DPRDatasetModule
-from callbacks import get_default_callbacks
+
+
+class SyncFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx: Any, questions: Tensor, contexts: Tensor,
+                positive_ids: Tensor, is_valid: Tensor) -> Any:
+        def gather_tensor(tensor: Tensor):
+            gathered_tensor = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(gathered_tensor, tensor)
+            return gathered_tensor
+
+        ctx.question_batch = questions.shape[0]
+        ctx.context_batch = contexts.shape[0]
+        ctx.batch_is_valid = is_valid
+
+        gathered_questions = gather_tensor(questions)
+        gathered_questions = torch.cat(gathered_questions, dim=0)
+
+        gathered_contexts = gather_tensor(contexts)
+        gathered_contexts = torch.cat(gathered_contexts, dim=0)
+
+        gathered_positive_ids = gather_tensor(positive_ids)
+
+        gathered_is_valid = gather_tensor(is_valid)
+
+        shifted_positive_ids = []
+        offset = 0
+        offsets = {}
+        for rank, (positive_ids, is_valid) in enumerate(zip(gathered_positive_ids, gathered_is_valid)):
+            shifted_positive_ids.extend([int(sum(is_valid[:idx]) + offset) for idx in positive_ids])
+            offsets[rank] = offset
+            offset += int(sum(is_valid))
+        offsets[torch.distributed.get_world_size()] = offset
+
+        ctx.offsets = offsets
+        gathered_is_valid = torch.cat(gathered_is_valid, dim=0)
+
+        return gathered_questions, gathered_contexts[gathered_is_valid.type(torch.bool)], \
+            torch.tensor(shifted_positive_ids, dtype=torch.long, device=gathered_contexts.device)
+
+    @staticmethod
+    def backward(ctx: Any, questions_grad, contexts_grad, *args) -> Any:
+        questions_input_grad = questions_grad.clone()
+        context_input_grad = torch.zeros((ctx.context_batch, *contexts_grad.shape[1:]),
+                                         device=contexts_grad.device)
+
+        rank = torch.distributed.get_rank()
+        questions_from = rank * ctx.question_batch
+        questions_to = (rank + 1) * ctx.question_batch
+
+        contexts_from = ctx.offsets[rank]
+        contexts_to = ctx.offsets[rank + 1]
+
+        contexts_grad_cp = contexts_grad.clone()
+        context_input_grad[ctx.batch_is_valid.type(torch.bool)] = contexts_grad_cp[contexts_from:contexts_to]
+
+        return questions_input_grad[questions_from:questions_to], context_input_grad, None, None
 
 
 class DPRModel(pl.LightningModule):
@@ -50,8 +105,11 @@ class DPRModel(pl.LightningModule):
             projection_dim=context_projection_dim
         )
 
-    def forward(self, *args, **kwargs) -> Tuple[Tensor, Tensor]:
-        pass
+    def forward(self, question_input, ctx_input) -> Tuple[Tensor, Tensor]:
+        local_question_vectors = self.q_encoder(**question_input)[0]
+        local_ctx_vectors = self.ctx_encoder(**ctx_input)[0]
+
+        return local_question_vectors.contiguous(), local_ctx_vectors.contiguous()
 
     def _calculate_loss(self,
                         q_vectors,
@@ -73,45 +131,20 @@ class DPRModel(pl.LightningModule):
         ).sum()
         return loss, correct_predictions_count
 
-    def _produce_question_ctx_vectors(self, question_input, ctx_input, positive_context_ids,
-                                      is_valid, sync_grads=False):
-        local_question_vectors = self.q_encoder(**question_input)[0]
-        local_ctx_vectors = self.ctx_encoder(**ctx_input)[0]
-
-        (global_question_vectors,
-         global_ctx_vectors,
-         global_positive_context_ids,
-         is_valid) = self.all_gather((
-            local_question_vectors,
-            local_ctx_vectors,
-            positive_context_ids,
-            is_valid
-         ), sync_grads=sync_grads)
-
-        global_question_vectors[self.global_rank] = local_question_vectors
-        global_ctx_vectors[self.global_rank] = local_ctx_vectors
-
-        offset = 0
-        shifted_positive_ids = []
-        for idx, (valid, positive_context_ids) in enumerate(zip(is_valid, global_positive_context_ids)):
-            shifted_positive_ids.extend([int(sum(valid[:idx]) + offset) for idx in positive_context_ids])
-            offset += int(sum(valid))
-
-        global_question_vectors = global_question_vectors.view(-1, global_question_vectors.shape[-1])
-        global_ctx_vectors = global_ctx_vectors.view(-1, global_ctx_vectors.shape[-1])
-        is_valid = is_valid.view(-1)
-        global_ctx_vectors = global_ctx_vectors[is_valid]
-        global_positive_context_ids = torch.tensor(shifted_positive_ids, dtype=torch.long)
-
-        return global_question_vectors, global_ctx_vectors, global_positive_context_ids
-
-    def training_step(self, batch, batch_idx):
+    def shared_step(self, batch):
         question_input, ctx_input, positive_context_ids, is_valid = batch
+
+        local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
+
         global_question_vectors, global_ctx_vectors, positive_context_ids = \
-            self._produce_question_ctx_vectors(question_input, ctx_input,
-                                               positive_context_ids, is_valid, sync_grads=True)
+            SyncFunction.apply(local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid)
 
         loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
+        return loss, num_correct
+
+    def training_step(self, batch, batch_idx):
+        loss, num_correct = self.shared_step(batch)
+
         if self.avg_train_num_correct == -1:
             self.avg_train_num_correct = num_correct
             self.avg_train_loss = loss
@@ -128,13 +161,7 @@ class DPRModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
-        question_input, ctx_input, positive_context_ids, is_valid = batch
-
-        global_question_vectors, global_ctx_vectors, positive_context_ids = \
-            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
-
-        loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
-        return loss, num_correct
+        return self.shared_step(batch)
 
     def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         losses, num_correct = list(zip(*outputs))
@@ -150,12 +177,7 @@ class DPRModel(pl.LightningModule):
         })
 
     def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
-        question_input, ctx_input, positive_context_ids, is_valid = batch
-        global_question_vectors, global_ctx_vectors, positive_context_ids = \
-            self._produce_question_ctx_vectors(question_input, ctx_input, positive_context_ids, is_valid)
-
-        loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
-        return loss, num_correct
+        return self.shared_step(batch)
 
     def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         losses, num_correct = list(zip(*outputs))
@@ -228,8 +250,9 @@ if __name__ == '__main__':
     pl.Trainer.add_argparse_args(parser)
     DPRModel.add_model_specific_args(parser)
     DPRDatasetModule.add_argparse_args(parser)
-    parser.add_argument('--model_name_or_path', default=None, help='Model name or path used to initialize both question and context encoder. '
-                                                                   'For more control use <question/context>_model_name_or_path')
+    parser.add_argument('--model_name_or_path', default=None,
+                        help='Model name or path used to initialize both question and context encoder. '
+                             'For more control use <question/context>_model_name_or_path')
     parser.add_argument('--question_model_name_or_path', default=None, help='Question encoder pretrained model')
     parser.add_argument('--context_model_name_or_path', default=None, help='Context encoder pretrained model')
     parser.add_argument('--question_projection_dim', default=0, type=int, help='Question encoder projection dim')
@@ -289,7 +312,7 @@ if __name__ == '__main__':
     )
 
     if wandb_logger:
-        wandb_logger.watch(model)
+        pass #wandb_logger.watch(model)
 
     dpr_datamodule = DPRDatasetModule(q_tokenizer=model.q_tokenizer, ctx_tokenizer=model.q_tokenizer, args=args)
     if args.do_train:

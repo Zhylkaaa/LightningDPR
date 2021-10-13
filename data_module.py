@@ -42,13 +42,17 @@ class DPRDistributedSamplerWithValidation(Sampler[T_co]):
                  seed: int = 0, drop_last: bool = False,
                  disjoint_window_size: int = 1, resampling_count: int = 100) -> None:
         if num_replicas is None:
-            if not dist.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            num_replicas = dist.get_world_size()
+            if not dist.is_available() or not dist.is_initialized():
+                num_replicas = 1
+                logger.info('Detected single node usage (probably dp mode) using num_replicas = 1')
+            else:
+                num_replicas = dist.get_world_size()
         if rank is None:
-            if not dist.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            rank = dist.get_rank()
+            if not dist.is_available() or not dist.is_initialized():
+                rank = 0
+                logger.info('Detected single node usage (probably dp mode) using rank = 1')
+            else:
+                rank = dist.get_rank()
         if rank >= num_replicas or rank < 0:
             raise ValueError(
                 "Invalid rank {}, rank should be in the interval"
@@ -109,6 +113,16 @@ class DPRDistributedSamplerWithValidation(Sampler[T_co]):
         else:
             indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
 
+            g = torch.Generator()
+            g.manual_seed(self.seed)
+            if self.disjoint_window_size > 1:
+                for _ in range(self.resampling_count + 1):
+                    if self._is_valid(indices):
+                        break
+                    indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+
+
+
         if not self.drop_last:
             # add extra samples to make it evenly divisible
             padding_size = self.total_size - len(indices)
@@ -146,6 +160,9 @@ class DPRDatasetModule(pl.LightningDataModule):
         self.args = args
         self.q_tokenizer = q_tokenizer
         self.ctx_tokenizer = ctx_tokenizer
+        self.sep_token = self.ctx_tokenizer.sep_token \
+            if self.ctx_tokenizer.sep_token is not None else self.ctx_tokenizer.eos_token
+        self.pad_token = self.ctx_tokenizer.pad_token
         self.dataset: Dict[str, Optional[List]] = {
             'train': None,
             'dev': None,
@@ -185,11 +202,9 @@ class DPRDatasetModule(pl.LightningDataModule):
         num_devices = max(1, self.args.gpus)
         effective_batch_size = self.args.train_batch_size * num_devices * self.args.accumulate_grad_batches
 
-        # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['train'], seed=self.args.seed,
-        #                                               disjoint_window_size=effective_batch_size, resampling_count=100,
-        #                                               shuffle=True)
-
-        sampler = None
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['train'], seed=self.args.seed,
+                                                      disjoint_window_size=effective_batch_size, resampling_count=100,
+                                                      shuffle=True)
 
         return DataLoader(
             self.dataset['train'],
@@ -203,10 +218,12 @@ class DPRDatasetModule(pl.LightningDataModule):
         if self.dataset['dev'] is None:
             return None
 
-        # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['dev'], seed=self.args.seed,
-        #                                               disjoint_window_size=1,
-        #                                               shuffle=False)
-        sampler = None
+        num_devices = max(1, self.args.gpus)
+        effective_batch_size = self.args.eval_batch_size * num_devices
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['dev'], seed=self.args.seed,
+                                                      disjoint_window_size=effective_batch_size,
+                                                      shuffle=False)
+
         return DataLoader(
             self.dataset['dev'],
             batch_size=self.args.eval_batch_size,
@@ -219,10 +236,11 @@ class DPRDatasetModule(pl.LightningDataModule):
         if self.dataset['test'] is None:
             return None
 
-        # sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['test'], seed=self.args.seed,
-        #                                               disjoint_window_size=1,
-        #                                               shuffle=False)
-        sampler = None
+        num_devices = max(1, self.args.gpus)
+        effective_batch_size = self.args.eval_batch_size * num_devices
+        sampler = DPRDistributedSamplerWithValidation(dataset=self.dataset['test'], seed=self.args.seed,
+                                                      disjoint_window_size=effective_batch_size,
+                                                      shuffle=False)
         return DataLoader(
             self.dataset['dev'],
             batch_size=self.args.eval_batch_size,
@@ -236,7 +254,6 @@ class DPRDatasetModule(pl.LightningDataModule):
         batch_ctxs = []
         positive_context_ids = []
         batch_is_valid = []
-        pad_token = self.ctx_tokenizer.sep_token
 
         for question_with_ctxs in questions_with_ctxs:
             batch_questions.append(question_with_ctxs['question'])
@@ -257,7 +274,7 @@ class DPRDatasetModule(pl.LightningDataModule):
                 for i in range(1 + len(negatives), 1 + self.args.num_negative_ctx):
                     is_valid[i] = 0
 
-                negatives += [{'title': pad_token, 'text': pad_token}
+                negatives += [{'title': self.pad_token, 'text': self.pad_token}
                               for _ in range(self.args.num_negative_ctx - len(negatives))]
 
             hard_negatives = hard_negatives[:self.args.num_hard_negative_ctx]
@@ -266,7 +283,7 @@ class DPRDatasetModule(pl.LightningDataModule):
                                1 + self.args.num_negative_ctx + self.args.num_hard_negative_ctx):
                     is_valid[i] = 0
 
-                hard_negatives += [{'title': pad_token, 'text': pad_token}
+                hard_negatives += [{'title': self.pad_token, 'text': self.pad_token}
                                    for _ in range(self.args.num_hard_negative_ctx - len(hard_negatives))]
 
             positive_context_ids.append(len(batch_ctxs))
@@ -274,8 +291,6 @@ class DPRDatasetModule(pl.LightningDataModule):
             batch_ctxs.append(positive)
             batch_ctxs.extend(negatives)
             batch_ctxs.extend(hard_negatives)
-
-        sep_token = self.ctx_tokenizer.sep_token if self.ctx_tokenizer.sep_token else self.ctx_tokenizer.eos_token
 
         question_input = self.q_tokenizer.batch_encode_plus(
             batch_questions,
@@ -286,8 +301,8 @@ class DPRDatasetModule(pl.LightningDataModule):
         )
 
         ctx_input = self.ctx_tokenizer.batch_encode_plus(
-            [f' {sep_token} '.join([ctx['title'], ctx['text']])
-             if self.args.insert_titles and not ctx['text'] == pad_token
+            [f' {self.sep_token} '.join([ctx['title'], ctx['text']])
+             if self.args.insert_titles and not ctx['text'] == self.pad_token
              else ctx['text']
              for ctx in batch_ctxs],
             max_length=self.args.ctx_max_seq_len,
@@ -295,10 +310,12 @@ class DPRDatasetModule(pl.LightningDataModule):
             padding='longest',
             return_tensors='pt'
         )
-
         positive_context_ids = torch.tensor(positive_context_ids, dtype=torch.long)
         batch_is_valid = torch.tensor(batch_is_valid, dtype=torch.long)
-        return question_input, ctx_input, positive_context_ids, batch_is_valid
+        # this ugly data processing is necessary for Data Parallel as it's only capable of working with Tensors and Lists # noqa
+        return question_input['input_ids'], question_input['attention_mask'], \
+               ctx_input['input_ids'], ctx_input['attention_mask'], \
+               positive_context_ids, batch_is_valid
 
     @classmethod
     def add_argparse_args(cls, parent_parser: ArgumentParser, **kwargs) -> Optional[ArgumentParser]:

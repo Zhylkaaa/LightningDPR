@@ -1,3 +1,4 @@
+import time
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Any, Tuple, Optional, Dict
@@ -7,18 +8,21 @@ import torch
 import torch.nn.functional as F
 import torch.distributed
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
+from pytorch_lightning.plugins import DeepSpeedPlugin
 from torch import Tensor
 from transformers import (
     get_linear_schedule_with_warmup,
     AdamW,
 )
-
+import deepspeed
+from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from callbacks import get_default_callbacks
 from data_module import DPRDatasetModule
 from dpr_model import DPRContextEncoder, DPRQuestionEncoder
 from utils import (
     init_dpr_component_from_pretrained_model
 )
+
 
 
 class SyncFunction(torch.autograd.Function):
@@ -79,6 +83,17 @@ class SyncFunction(torch.autograd.Function):
         return questions_input_grad[questions_from:questions_to], context_input_grad, None, None
 
 
+# For further optimization
+class AggregateModel(torch.nn.Module):
+    def __init__(self, q_encoder, ctx_encoder):
+        super().__init__()
+        self.q_encoder = q_encoder
+        self.ctx_encoder = ctx_encoder
+
+    def forward(self, *inputs):
+        return self.q_encoder(*inputs[0])[0], self.ctx_encoder(*inputs[1])[0]
+
+
 class DPRModel(pl.LightningModule):
     def __init__(self,
                  question_model_name_or_path: str,
@@ -93,21 +108,26 @@ class DPRModel(pl.LightningModule):
         self.avg_train_num_correct = -1
         self.avg_train_loss = 0
         self.output_dir = Path(self.hparams.output_dir)
-        self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
+        q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
             model_name_or_path=question_model_name_or_path,
             component_class=DPRQuestionEncoder,
             projection_dim=question_projection_dim
         )
 
-        self.ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
+        ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
             model_name_or_path=context_model_name_or_path,
             component_class=DPRContextEncoder,
             projection_dim=context_projection_dim
         )
 
+        self.model = AggregateModel(q_encoder, ctx_encoder)
+
     def forward(self, question_input, ctx_input) -> Tuple[Tensor, Tensor]:
-        local_question_vectors = self.q_encoder(**question_input)[0]
-        local_ctx_vectors = self.ctx_encoder(**ctx_input)[0]
+        if self.hparams.cpu_checkpointing:
+            local_question_vectors, local_ctx_vectors = \
+                deepspeed.checkpointing.checkpoint(self.model, (question_input, ctx_input))
+        else:
+            local_question_vectors, local_ctx_vectors = self.model(question_input, ctx_input)
 
         return local_question_vectors.contiguous(), local_ctx_vectors.contiguous()
 
@@ -131,19 +151,50 @@ class DPRModel(pl.LightningModule):
         ).sum()
         return loss, correct_predictions_count
 
-    def shared_step(self, batch):
-        question_input, ctx_input, positive_context_ids, is_valid = batch
+    def shared_step(self, batch, sync_grads=False):
+        local_question_vectors, local_ctx_vectors, positive_context_ids, is_valid = batch
 
-        local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            (global_question_vectors,
+             global_ctx_vectors,
+             global_positive_context_ids,
+             is_valid) = self.all_gather((
+                local_question_vectors,
+                local_ctx_vectors,
+                positive_context_ids,
+                is_valid
+             ), sync_grads=sync_grads)
 
-        global_question_vectors, global_ctx_vectors, positive_context_ids = \
-            SyncFunction.apply(local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid)
+            offset = 0
+            shifted_positive_ids = []
+            for idx, (valid, positive_context_ids) in enumerate(zip(is_valid, global_positive_context_ids)):
+                shifted_positive_ids.extend([int(sum(valid[:idx]) + offset) for idx in positive_context_ids])
+                offset += int(sum(valid))
+            global_question_vectors = global_question_vectors.view(-1, global_question_vectors.shape[-1])
+            global_ctx_vectors = global_ctx_vectors.view(-1, global_ctx_vectors.shape[-1])
+            is_valid = is_valid.view(-1)
+            global_ctx_vectors = global_ctx_vectors[is_valid.type(torch.bool)]
+            positive_context_ids = torch.tensor(shifted_positive_ids, dtype=torch.long)
+        else:
+            positive_context_ids = torch.tensor([int(sum(is_valid[:idx])) for idx in positive_context_ids],
+                                                dtype=torch.long, device=local_ctx_vectors.device)
+            global_question_vectors, global_ctx_vectors, positive_context_ids = \
+                local_question_vectors, local_ctx_vectors[is_valid.type(torch.bool)], positive_context_ids
 
         loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
         return loss, num_correct
 
     def training_step(self, batch, batch_idx):
-        loss, num_correct = self.shared_step(batch)
+        # question_input, ctx_input, positive_context_ids, is_valid = batch
+        question_input = batch[:2]
+        ctx_input = batch[2:4]
+        positive_context_ids, is_valid = batch[4:]
+
+        local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
+        return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
+
+    def training_step_end(self, train_step_outputs):
+        loss, num_correct = self.shared_step(train_step_outputs, sync_grads=True)
 
         if self.avg_train_num_correct == -1:
             self.avg_train_num_correct = num_correct
@@ -152,7 +203,7 @@ class DPRModel(pl.LightningModule):
             self.avg_train_num_correct = 0.9 * self.avg_train_num_correct + 0.1 * num_correct
             self.avg_train_loss = 0.9 * self.avg_train_loss + 0.1 * loss
 
-        if self.global_step % self.hparams.log_every_n_steps:
+        if self.global_step % self.hparams.log_every_n_steps and self.global_rank == 0:
             self.log_dict({
                 'train_avg_loss': self.avg_train_loss,
                 'train_avg_num_correct': self.avg_train_num_correct,
@@ -160,34 +211,56 @@ class DPRModel(pl.LightningModule):
             })
         return loss
 
-    def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
-        return self.shared_step(batch)
+    def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        # question_input, ctx_input, positive_context_ids, is_valid = batch
 
-    def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
+        question_input = batch[:2]
+        ctx_input = batch[2:4]
+        positive_context_ids, is_valid = batch[4:]
+
+        local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
+        return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
+
+    def validation_step_end(self, validation_step_outputs) -> Tuple[Tensor, Tensor]:
+        return self.shared_step(validation_step_outputs, sync_grads=False)
+
+    def _aggregate_validation_metrics(self, outputs: Tuple[Tensor, Tensor]):
         losses, num_correct = list(zip(*outputs))
         losses = torch.tensor(losses)
         num_correct = torch.tensor(num_correct)
 
         loss = torch.mean(losses).detach().cpu()
         num_correct = torch.sum(num_correct).detach().cpu()
+        return loss, num_correct
 
-        self.log_dict({
-            'val_loss': loss,
-            'val_num_correct': num_correct
-        })
+    def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
+        loss, num_correct = self._aggregate_validation_metrics(outputs)
+        if self.global_rank == 0:
+            self.log_dict({
+                'val_loss': loss,
+                'val_num_correct': num_correct
+            })
 
-    def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor]:
-        return self.shared_step(batch)
+    def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        # question_input, ctx_input, positive_context_ids, is_valid = batch
+
+        question_input = batch[:2]
+        ctx_input = batch[2:4]
+        positive_context_ids, is_valid = batch[4:]
+
+        local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
+        return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
+
+    def test_step_end(self, test_step_outputs) -> Tuple[Tensor, Tensor]:
+        return self.shared_step(test_step_outputs, sync_grads=False)
 
     def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
-        losses, num_correct = list(zip(*outputs))
-        loss = torch.mean(losses).detach().cpu()
-        num_correct = torch.sum(num_correct).detach().cpu()
-
-        self.log_dict({
-            'test_loss': loss,
-            'test_num_correct': num_correct
-        })
+        loss, num_correct = self._aggregate_validation_metrics(outputs)
+        if self.global_rank == 0:
+            self.log_dict({
+                'test_loss': loss,
+                'test_num_correct': num_correct
+            })
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage != 'fit':
@@ -211,7 +284,14 @@ class DPRModel(pl.LightningModule):
                 "weight_decay": 0.0,
             },
         ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
+        self.parameters()
+
+        if self.hparams.use_cpu_adam:
+            optimizer = DeepSpeedCPUAdam(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
+        elif self.hparams.use_fused_adam:
+            optimizer = FusedAdam(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
+        else:
+            optimizer = AdamW(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
         scheduler = get_linear_schedule_with_warmup(
             optimizer, num_warmup_steps=self.hparams.warmup_steps, num_training_steps=self.total_steps
         )
@@ -228,10 +308,10 @@ class DPRModel(pl.LightningModule):
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         base_save_path = self.output_dir.joinpath(f'checkpoint-{self.current_epoch}-{self.global_step}')
-        self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
+        self.model.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
         self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
 
-        self.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
+        self.model.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
         self.ctx_tokenizer.save_pretrained(base_save_path.joinpath('context_encoder'))
 
     @staticmethod
@@ -264,7 +344,13 @@ if __name__ == '__main__':
     parser.add_argument('--tb_log_dir', default='dpr_experiment', help='Tensorboard log dir')
     parser.add_argument('--wandb_project', default=None, help='Wandb project to log to')
     parser.add_argument('--monitor_metric', default='val_num_correct')
-    args = parser.parse_args()
+    parser.add_argument('--use_cpu_adam', action='store_true')
+    parser.add_argument('--use_fused_adam', action='store_true')
+    parser.add_argument('--use_deepspeed', action='store_true')
+    parser.add_argument('--cpu_checkpointing', action='store_true')
+    parser.add_argument('--offload_optimizer', action='store_true')
+    parser.add_argument('--offload_parameters', action='store_true')
+    args: Namespace = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
 
@@ -290,12 +376,25 @@ if __name__ == '__main__':
 
     tensorboard_logger = TensorBoardLogger(save_dir=args.tb_log_dir)
 
+    if args.plugins is not None and args.use_deepspeed:
+        raise ValueError('--use_deepspeed is used to define custom behaviour of DeepSpeedPlugin '
+                         'and can\'t be used with --plugins')
+
+    if args.use_deepspeed:
+        deepspeed_plugin = DeepSpeedPlugin(
+            stage=3,
+            offload_optimizer=args.offload_optimizer,
+            offload_parameters=args.offload_parameters,
+            cpu_checkpointing=args.cpu_checkpointing
+        )
+        args.plugins = deepspeed_plugin
+
     additional_args = {
         'precision': 16 if args.fp16 else 32,
         'amp_backend': 'native',
-        'replace_sampler_ddp': True,
+        'replace_sampler_ddp': False,
         'callbacks': callbacks,
-        'logger': [tensorboard_logger, wandb_logger] if wandb_logger else tensorboard_logger
+        'logger': [tensorboard_logger, wandb_logger] if wandb_logger else tensorboard_logger,
     }
 
     model = DPRModel(

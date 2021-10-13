@@ -84,6 +84,7 @@ class SyncFunction(torch.autograd.Function):
 
 
 # For further optimization
+# TODO: remove as it's no longer helpful (and it's ugly)
 class AggregateModel(torch.nn.Module):
     def __init__(self, q_encoder, ctx_encoder):
         super().__init__()
@@ -141,13 +142,13 @@ class DPRModel(pl.LightningModule):
 
         loss = F.nll_loss(
             softmax_scores,
-            torch.tensor(positive_ids).to(softmax_scores.device),
+            positive_ids.to(softmax_scores.device),
             reduction="mean",
         )
 
         max_score, max_idxs = torch.max(softmax_scores, 1)
         correct_predictions_count = (
-                max_idxs == torch.tensor(positive_ids).to(max_idxs.device)
+                max_idxs == positive_ids.to(max_idxs.device)
         ).sum()
         return loss, correct_predictions_count
 

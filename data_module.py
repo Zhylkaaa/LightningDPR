@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, Sampler, Dataset
 from torch.utils.data.distributed import T_co
 import torch.distributed as dist
 
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, AutoTokenizer
 import pytorch_lightning as pl
 
 logger = logging.getLogger(__name__)
@@ -152,17 +152,14 @@ class DPRDistributedSamplerWithValidation(Sampler[T_co]):
 class DPRDatasetModule(pl.LightningDataModule):
     def __init__(
             self,
-            q_tokenizer: PreTrainedTokenizer,
-            ctx_tokenizer: PreTrainedTokenizer,
+            q_tokenizer_path: PreTrainedTokenizer,
+            ctx_tokenizer_path: PreTrainedTokenizer,
             args: Namespace,
     ):
         super(DPRDatasetModule, self).__init__()
         self.args = args
-        self.q_tokenizer = q_tokenizer
-        self.ctx_tokenizer = ctx_tokenizer
-        self.sep_token = self.ctx_tokenizer.sep_token \
-            if self.ctx_tokenizer.sep_token is not None else self.ctx_tokenizer.eos_token
-        self.pad_token = self.ctx_tokenizer.pad_token
+        self.q_tokenizer_path = q_tokenizer_path
+        self.ctx_tokenizer_path = ctx_tokenizer_path
         self.dataset: Dict[str, Optional[List]] = {
             'train': None,
             'dev': None,
@@ -181,6 +178,13 @@ class DPRDatasetModule(pl.LightningDataModule):
                     if len(d['positive_ctxs']) > 0
                 ]
                 self.dataset[data_split] = filtered_data
+
+        self.q_tokenizer = AutoTokenizer.from_pretrained(self.q_tokenizer_path)
+        self.ctx_tokenizer = AutoTokenizer.from_pretrained(self.ctx_tokenizer_path)
+
+        self.sep_token = self.ctx_tokenizer.sep_token \
+            if self.ctx_tokenizer.sep_token is not None else self.ctx_tokenizer.eos_token
+        self.pad_token = self.ctx_tokenizer.pad_token
 
     def prepare_data(self) -> None:
         for data_split, data_file in [('train', self.args.train_data),
@@ -242,7 +246,7 @@ class DPRDatasetModule(pl.LightningDataModule):
                                                       disjoint_window_size=effective_batch_size,
                                                       shuffle=False)
         return DataLoader(
-            self.dataset['dev'],
+            self.dataset['test'],
             batch_size=self.args.eval_batch_size,
             sampler=sampler,
             num_workers=self.args.num_workers,

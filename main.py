@@ -22,7 +22,7 @@ from dpr_model import DPRContextEncoder, DPRQuestionEncoder
 from utils import (
     init_dpr_component_from_pretrained_model
 )
-
+from fairscale.nn import checkpoint_wrapper, auto_wrap, wrap
 
 
 class SyncFunction(torch.autograd.Function):
@@ -68,7 +68,7 @@ class SyncFunction(torch.autograd.Function):
     def backward(ctx: Any, questions_grad, contexts_grad, *args) -> Any:
         questions_input_grad = questions_grad.clone()
         context_input_grad = torch.zeros((ctx.context_batch, *contexts_grad.shape[1:]),
-                                         device=contexts_grad.device)
+                                         dtype=contexts_grad, device=contexts_grad.device)
 
         rank = torch.distributed.get_rank()
         questions_from = rank * ctx.question_batch
@@ -84,7 +84,6 @@ class SyncFunction(torch.autograd.Function):
 
 
 # For further optimization
-# TODO: remove as it's no longer helpful (and it's ugly)
 class AggregateModel(torch.nn.Module):
     def __init__(self, q_encoder, ctx_encoder):
         super().__init__()
@@ -109,26 +108,54 @@ class DPRModel(pl.LightningModule):
         self.avg_train_num_correct = -1
         self.avg_train_loss = 0
         self.output_dir = Path(self.hparams.output_dir)
-        q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
-            model_name_or_path=question_model_name_or_path,
-            component_class=DPRQuestionEncoder,
-            projection_dim=question_projection_dim
-        )
+        self.question_model_name_or_path = question_model_name_or_path
+        self.context_model_name_or_path = context_model_name_or_path
+        self.question_projection_dim = question_projection_dim
+        self.context_projection_dim = context_projection_dim
 
-        ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
-            model_name_or_path=context_model_name_or_path,
-            component_class=DPRContextEncoder,
-            projection_dim=context_projection_dim
-        )
+        if not self.hparams.configure_sharded_model:
+            self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
+                model_name_or_path=question_model_name_or_path,
+                component_class=DPRQuestionEncoder,
+                projection_dim=question_projection_dim,
+                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
+            )
 
-        self.model = AggregateModel(q_encoder, ctx_encoder)
+            self.ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
+                model_name_or_path=context_model_name_or_path,
+                component_class=DPRContextEncoder,
+                projection_dim=context_projection_dim,
+                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
+            )
+
+    def configure_sharded_model(self) -> None:
+        if self.hparams.configure_sharded_model:
+            self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
+                model_name_or_path=self.question_model_name_or_path,
+                component_class=DPRQuestionEncoder,
+                projection_dim=self.question_projection_dim,
+                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
+            )
+            self.q_encoder = auto_wrap(self.q_encoder)
+
+            self.ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
+                model_name_or_path=self.context_model_name_or_path,
+                component_class=DPRContextEncoder,
+                projection_dim=self.context_projection_dim,
+                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
+            )
+
+            self.ctx_encoder = auto_wrap(self.ctx_encoder)
 
     def forward(self, question_input, ctx_input) -> Tuple[Tensor, Tensor]:
-        if self.hparams.cpu_checkpointing:
-            local_question_vectors, local_ctx_vectors = \
-                deepspeed.checkpointing.checkpoint(self.model, (question_input, ctx_input))
+        if self.hparams.cpu_checkpointing or self.hparams.partition_activations:
+            local_question_vectors = \
+                deepspeed.checkpointing.checkpoint(self.q_encoder, *question_input)[0]
+            local_ctx_vectors = \
+                deepspeed.checkpointing.checkpoint(self.ctx_encoder, *ctx_input)[0]
         else:
-            local_question_vectors, local_ctx_vectors = self.model(question_input, ctx_input)
+            local_question_vectors, local_ctx_vectors = \
+                self.q_encoder(*question_input)[0], self.ctx_encoder(*ctx_input)[0]
 
         return local_question_vectors.contiguous(), local_ctx_vectors.contiguous()
 
@@ -176,6 +203,10 @@ class DPRModel(pl.LightningModule):
             is_valid = is_valid.view(-1)
             global_ctx_vectors = global_ctx_vectors[is_valid.type(torch.bool)]
             positive_context_ids = torch.tensor(shifted_positive_ids, dtype=torch.long)
+            # (global_question_vectors,
+            #  global_ctx_vectors,
+            #  positive_context_ids) = \
+            #     SyncFunction.apply(local_question_vectors, local_ctx_vectors, positive_context_ids, is_valid)
         else:
             positive_context_ids = torch.tensor([int(sum(is_valid[:idx])) for idx in positive_context_ids],
                                                 dtype=torch.long, device=local_ctx_vectors.device)
@@ -204,7 +235,7 @@ class DPRModel(pl.LightningModule):
             self.avg_train_num_correct = 0.9 * self.avg_train_num_correct + 0.1 * num_correct
             self.avg_train_loss = 0.9 * self.avg_train_loss + 0.1 * loss
 
-        if self.global_step % self.hparams.log_every_n_steps and self.global_rank == 0:
+        if self.global_step % self.hparams.log_every_n_steps:
             self.log_dict({
                 'train_avg_loss': self.avg_train_loss,
                 'train_avg_num_correct': self.avg_train_num_correct,
@@ -236,11 +267,10 @@ class DPRModel(pl.LightningModule):
 
     def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         loss, num_correct = self._aggregate_validation_metrics(outputs)
-        if self.global_rank == 0:
-            self.log_dict({
-                'val_loss': loss,
-                'val_num_correct': num_correct
-            })
+        self.log_dict({
+            'val_loss': loss,
+            'val_num_correct': num_correct
+        })
 
     def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # question_input, ctx_input, positive_context_ids, is_valid = batch
@@ -257,11 +287,10 @@ class DPRModel(pl.LightningModule):
 
     def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         loss, num_correct = self._aggregate_validation_metrics(outputs)
-        if self.global_rank == 0:
-            self.log_dict({
-                'test_loss': loss,
-                'test_num_correct': num_correct
-            })
+        self.log_dict({
+            'test_loss': loss,
+            'test_num_correct': num_correct
+        })
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage != 'fit':
@@ -285,7 +314,6 @@ class DPRModel(pl.LightningModule):
                 "weight_decay": 0.0,
             },
         ]
-        self.parameters()
 
         if self.hparams.use_cpu_adam:
             optimizer = DeepSpeedCPUAdam(optimizer_grouped_parameters, lr=self.hparams.learning_rate, eps=self.hparams.adam_epsilon)
@@ -309,10 +337,10 @@ class DPRModel(pl.LightningModule):
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         base_save_path = self.output_dir.joinpath(f'checkpoint-{self.current_epoch}-{self.global_step}')
-        self.model.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
+        self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
         self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
 
-        self.model.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
+        self.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
         self.ctx_tokenizer.save_pretrained(base_save_path.joinpath('context_encoder'))
 
     @staticmethod
@@ -351,6 +379,9 @@ if __name__ == '__main__':
     parser.add_argument('--cpu_checkpointing', action='store_true')
     parser.add_argument('--offload_optimizer', action='store_true')
     parser.add_argument('--offload_parameters', action='store_true')
+    parser.add_argument('--partition_activations', action='store_true')
+    parser.add_argument('--configure_sharded_model', action='store_true')
+    parser.add_argument('--is_dpr_checkpoint', action='store_true')
     args: Namespace = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -386,7 +417,8 @@ if __name__ == '__main__':
             stage=3,
             offload_optimizer=args.offload_optimizer,
             offload_parameters=args.offload_parameters,
-            cpu_checkpointing=args.cpu_checkpointing
+            cpu_checkpointing=args.cpu_checkpointing,
+            partition_activations=args.partition_activations
         )
         args.plugins = deepspeed_plugin
 
@@ -414,7 +446,8 @@ if __name__ == '__main__':
     if wandb_logger:
         pass #wandb_logger.watch(model)
 
-    dpr_datamodule = DPRDatasetModule(q_tokenizer=model.q_tokenizer, ctx_tokenizer=model.q_tokenizer, args=args)
+    dpr_datamodule = DPRDatasetModule(q_tokenizer_path=question_model_name_or_path,
+                                      ctx_tokenizer_path=context_model_name_or_path, args=args)
     if args.do_train:
         trainer.fit(model, datamodule=dpr_datamodule)
 

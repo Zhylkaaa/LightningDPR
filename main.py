@@ -254,7 +254,8 @@ class DPRModel(pl.LightningModule):
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
 
     def validation_step_end(self, validation_step_outputs) -> Tuple[Tensor, Tensor]:
-        return self.shared_step(validation_step_outputs, sync_grads=False)
+        loss, num_correct = self.shared_step(validation_step_outputs, sync_grads=False)
+        return loss, num_correct
 
     def _aggregate_validation_metrics(self, outputs: Tuple[Tensor, Tensor]):
         losses, num_correct = list(zip(*outputs))
@@ -267,10 +268,13 @@ class DPRModel(pl.LightningModule):
 
     def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         loss, num_correct = self._aggregate_validation_metrics(outputs)
-        self.log_dict({
-            'val_loss': loss,
-            'val_num_correct': num_correct
-        })
+
+        self.log('val_loss', loss)
+        self.log('val_num_correct', num_correct)
+        # self.log_dict({
+        #     'val_loss': loss,
+        #     'val_num_correct': num_correct
+        # }, sync_dist=True)
 
     def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # question_input, ctx_input, positive_context_ids, is_valid = batch
@@ -287,10 +291,12 @@ class DPRModel(pl.LightningModule):
 
     def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
         loss, num_correct = self._aggregate_validation_metrics(outputs)
-        self.log_dict({
-            'test_loss': loss,
-            'test_num_correct': num_correct
-        })
+        self.log('test_loss', loss)
+        self.log('test_num_correct', num_correct)
+        # self.log_dict({
+        #     'test_loss': loss,
+        #     'test_num_correct': num_correct
+        # }, sync_dist=True)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage != 'fit':
@@ -334,14 +340,14 @@ class DPRModel(pl.LightningModule):
             },
         }
 
-    @pl.utilities.rank_zero_only
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        base_save_path = self.output_dir.joinpath(f'checkpoint-{self.current_epoch}-{self.global_step}')
-        self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
-        self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
-
-        self.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
-        self.ctx_tokenizer.save_pretrained(base_save_path.joinpath('context_encoder'))
+    # @pl.utilities.rank_zero_only
+    # def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+    #     base_save_path = self.output_dir.joinpath(f'checkpoint-{self.current_epoch}-{self.global_step}')
+    #     self.q_encoder.save_pretrained(base_save_path.joinpath('question_encoder'))
+    #     self.q_tokenizer.save_pretrained(base_save_path.joinpath('question_encoder'))
+    #
+    #     self.ctx_encoder.save_pretrained(base_save_path.joinpath('context_encoder'))
+    #     self.ctx_tokenizer.save_pretrained(base_save_path.joinpath('context_encoder'))
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -382,6 +388,7 @@ if __name__ == '__main__':
     parser.add_argument('--partition_activations', action='store_true')
     parser.add_argument('--configure_sharded_model', action='store_true')
     parser.add_argument('--is_dpr_checkpoint', action='store_true')
+    parser.add_argument('--no_save_full_weights', action='store_true')
     args: Namespace = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -418,7 +425,8 @@ if __name__ == '__main__':
             offload_optimizer=args.offload_optimizer,
             offload_parameters=args.offload_parameters,
             cpu_checkpointing=args.cpu_checkpointing,
-            partition_activations=args.partition_activations
+            partition_activations=args.partition_activations,
+            save_full_weights=(not args.no_save_full_weights)
         )
         args.plugins = deepspeed_plugin
 

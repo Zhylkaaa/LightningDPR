@@ -2,6 +2,7 @@ import time
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Any, Tuple, Optional, Dict
+import json
 
 import pytorch_lightning as pl
 import torch
@@ -128,6 +129,10 @@ class DPRModel(pl.LightningModule):
                 is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
             )
 
+        if self.hparams.cpu_checkpointing or self.hparams.partition_activations or self.hparams.use_checkpointing:
+            self.q_encoder.gradient_checkpointing_enable(use_deepspeed=True)
+            self.ctx_encoder.gradient_checkpointing_enable(use_deepspeed=True)
+
     def configure_sharded_model(self) -> None:
         if self.hparams.configure_sharded_model:
             self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
@@ -148,14 +153,8 @@ class DPRModel(pl.LightningModule):
             self.ctx_encoder = auto_wrap(self.ctx_encoder)
 
     def forward(self, question_input, ctx_input) -> Tuple[Tensor, Tensor]:
-        if self.hparams.cpu_checkpointing or self.hparams.partition_activations:
-            local_question_vectors = \
-                deepspeed.checkpointing.checkpoint(self.q_encoder, *question_input)[0]
-            local_ctx_vectors = \
-                deepspeed.checkpointing.checkpoint(self.ctx_encoder, *ctx_input)[0]
-        else:
-            local_question_vectors, local_ctx_vectors = \
-                self.q_encoder(*question_input)[0], self.ctx_encoder(*ctx_input)[0]
+        local_question_vectors, local_ctx_vectors = \
+            self.q_encoder(**question_input)[0], self.ctx_encoder(**ctx_input)[0]
 
         return local_question_vectors.contiguous(), local_ctx_vectors.contiguous()
 
@@ -217,10 +216,10 @@ class DPRModel(pl.LightningModule):
         return loss, num_correct
 
     def training_step(self, batch, batch_idx):
-        # question_input, ctx_input, positive_context_ids, is_valid = batch
-        question_input = batch[:2]
-        ctx_input = batch[2:4]
-        positive_context_ids, is_valid = batch[4:]
+        question_input, ctx_input, positive_context_ids, is_valid = batch
+        # question_input = batch[:2]
+        # ctx_input = batch[2:4]
+        # positive_context_ids, is_valid = batch[4:]
 
         local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
@@ -244,11 +243,11 @@ class DPRModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        # question_input, ctx_input, positive_context_ids, is_valid = batch
+        question_input, ctx_input, positive_context_ids, is_valid = batch
 
-        question_input = batch[:2]
-        ctx_input = batch[2:4]
-        positive_context_ids, is_valid = batch[4:]
+        # question_input = batch[:2]
+        # ctx_input = batch[2:4]
+        # positive_context_ids, is_valid = batch[4:]
 
         local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
@@ -277,11 +276,11 @@ class DPRModel(pl.LightningModule):
         # }, sync_dist=True)
 
     def test_step(self, batch, batch_idx) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        # question_input, ctx_input, positive_context_ids, is_valid = batch
+        question_input, ctx_input, positive_context_ids, is_valid = batch
 
-        question_input = batch[:2]
-        ctx_input = batch[2:4]
-        positive_context_ids, is_valid = batch[4:]
+        # question_input = batch[:2]
+        # ctx_input = batch[2:4]
+        # positive_context_ids, is_valid = batch[4:]
 
         local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
@@ -306,7 +305,7 @@ class DPRModel(pl.LightningModule):
         num_devices = max(1, trainer.gpus)
         effective_batch_size = self.hparams.train_batch_size * num_devices * trainer.accumulate_grad_batches
 
-        self.total_steps = (len(train_loader.dataset) / effective_batch_size) * trainer.max_epochs
+        self.total_steps = int((len(train_loader.dataset) / effective_batch_size) * trainer.max_epochs)
 
     def configure_optimizers(self):
         no_decay = ["bias", "LayerNorm.weight"]
@@ -384,11 +383,13 @@ if __name__ == '__main__':
     parser.add_argument('--use_deepspeed', action='store_true')
     parser.add_argument('--cpu_checkpointing', action='store_true')
     parser.add_argument('--offload_optimizer', action='store_true')
+    parser.add_argument('--use_checkpointing', action='store_true')
     parser.add_argument('--offload_parameters', action='store_true')
     parser.add_argument('--partition_activations', action='store_true')
     parser.add_argument('--configure_sharded_model', action='store_true')
     parser.add_argument('--is_dpr_checkpoint', action='store_true')
     parser.add_argument('--no_save_full_weights', action='store_true')
+    parser.add_argument('--ds_config_path', default=None, type=str)
     args: Namespace = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -411,7 +412,7 @@ if __name__ == '__main__':
 
     wandb_logger = None
     if args.wandb_project is not None:
-        wandb_logger = WandbLogger(project=args.wandb_project, log_model='all')
+        wandb_logger = WandbLogger(project=args.wandb_project)
 
     tensorboard_logger = TensorBoardLogger(save_dir=args.tb_log_dir)
 
@@ -420,15 +421,45 @@ if __name__ == '__main__':
                          'and can\'t be used with --plugins')
 
     if args.use_deepspeed:
-        deepspeed_plugin = DeepSpeedPlugin(
-            stage=3,
-            offload_optimizer=args.offload_optimizer,
-            offload_parameters=args.offload_parameters,
-            cpu_checkpointing=args.cpu_checkpointing,
-            partition_activations=args.partition_activations,
-            save_full_weights=(not args.no_save_full_weights)
-        )
-        args.plugins = deepspeed_plugin
+        if args.ds_config_path:
+            dpr_datamodule = DPRDatasetModule(q_tokenizer_path=question_model_name_or_path,
+                                              ctx_tokenizer_path=context_model_name_or_path, args=args)
+            dpr_datamodule.setup()
+            with open(args.ds_config_path) as f:
+                config = json.load(f)
+            num_devices = max(1, args.gpus)
+            effective_batch_size = num_devices * args.accumulate_grad_batches
+
+            total_steps = int((len(dpr_datamodule.train_dataloader()) / effective_batch_size) * args.max_epochs)
+            config['scheduler']['params']['warmup_num_steps'] = args.warmup_steps
+            config['scheduler']['params']['total_num_steps'] = total_steps
+            config['train_micro_batch_size_per_gpu'] = args.train_batch_size
+            print(total_steps)
+            print(config)
+        else:
+            config = args.ds_config_path
+
+        if pl.__version__ == '1.4.9':
+            plugin = DeepSpeedPlugin(
+                stage=3,
+                offload_optimizer=args.offload_optimizer,
+                offload_parameters=args.offload_parameters,
+                cpu_checkpointing=args.cpu_checkpointing,
+                partition_activations=args.partition_activations,
+                save_full_weights=(not args.no_save_full_weights),
+                config=config
+            )
+        else:
+            plugin = DeepSpeedPlugin(
+                stage=3,
+                offload_optimizer=args.offload_optimizer,
+                offload_parameters=args.offload_parameters,
+                cpu_checkpointing=args.cpu_checkpointing,
+                partition_activations=args.partition_activations,
+                config=config
+            )
+    else:
+        plugin = None
 
     additional_args = {
         'precision': 16 if args.fp16 else 32,
@@ -436,6 +467,7 @@ if __name__ == '__main__':
         'replace_sampler_ddp': False,
         'callbacks': callbacks,
         'logger': [tensorboard_logger, wandb_logger] if wandb_logger else tensorboard_logger,
+        'plugins': plugin,
     }
 
     model = DPRModel(

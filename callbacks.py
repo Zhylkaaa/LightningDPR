@@ -11,7 +11,7 @@ def get_default_callbacks(args):
         verbose=True,
         save_top_k=-1,
         mode='max',
-        every_n_val_epochs=1,
+        every_n_epochs=1,
     )
     if checkpoint_callback:
         callbacks.append(checkpoint_callback)

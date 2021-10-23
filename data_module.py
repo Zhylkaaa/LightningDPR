@@ -316,10 +316,8 @@ class DPRDatasetModule(pl.LightningDataModule):
         )
         positive_context_ids = torch.tensor(positive_context_ids, dtype=torch.long)
         batch_is_valid = torch.tensor(batch_is_valid, dtype=torch.long)
-        # this ugly data processing is necessary for Data Parallel as it's only capable of working with Tensors and Lists # noqa
-        return question_input['input_ids'], question_input['attention_mask'], \
-               ctx_input['input_ids'], ctx_input['attention_mask'], \
-               positive_context_ids, batch_is_valid
+
+        return question_input, ctx_input, positive_context_ids, batch_is_valid
 
     @classmethod
     def add_argparse_args(cls, parent_parser: ArgumentParser, **kwargs) -> Optional[ArgumentParser]:

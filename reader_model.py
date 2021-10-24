@@ -54,7 +54,12 @@ class ReaderModel(pl.LightningModule):
 
     def _calculate_loss(self, logits):
         labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, labels)
+        if self.hparams.weight_examples:
+            loss = F.cross_entropy(logits, labels, reduction='none')
+            weights = (1 - torch.softmax(logits, dim=1)[:, 0]) ** 2
+            loss = torch.sum(loss * weights) / torch.clamp(torch.sum(weights), min=1e-6)
+        else:
+            loss = F.cross_entropy(logits, labels)
         return loss
 
     def shared_step(self, batch) -> Tuple[Tensor, Tensor]:
@@ -161,6 +166,7 @@ class ReaderModel(pl.LightningModule):
         parser.add_argument('--num_train_epochs', dest="max_epochs", default=1, type=int)
         parser.add_argument('--learning_rate', default=5e-5, type=float, help="The initial learning rate for Adam.")
         parser.add_argument('--output_dir', default='dpr_model', type=str)
+        parser.add_argument('--weight_examples', action='store_true')
 
 
 if __name__ == '__main__':

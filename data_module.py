@@ -88,7 +88,7 @@ class DPRDistributedSamplerWithValidation(Sampler[T_co]):
         current_contexts = set()
 
         for idx, i in enumerate(indexes):
-            if (idx + 1) % self.disjoint_window_size == 0:
+            if idx % self.disjoint_window_size == 0:
                 current_contexts.clear()
 
             positives = concat_inputs(self.dataset[i]['positive_ctxs'])

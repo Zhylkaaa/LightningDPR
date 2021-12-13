@@ -1,0 +1,14 @@
+python reader_model.py \
+--seed 42 \
+--fp16 \
+--do_predict \
+--monitor_metric val_acc \
+--output_dir dpr_reader_herbert_v1 \
+--eval_batch_size 4 \
+--test_data $TEST_DATA_FILE \
+--accelerator ddp \
+--gpus 1 \
+--num_nodes 1 \
+--num_negative_ctx 0 \
+--num_hard_negative_ctx 4 \
+--max_seq_len 386 \

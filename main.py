@@ -492,4 +492,4 @@ if __name__ == '__main__':
         trainer.fit(model, datamodule=dpr_datamodule)
 
     if args.do_predict:
-        trainer.test(model, datamodule=dpr_datamodule)
+        trainer.test(ckpt_path='best')

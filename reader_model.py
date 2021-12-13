@@ -57,7 +57,7 @@ class ReaderModel(pl.LightningModule):
         if self.hparams.weight_examples:
             loss = F.cross_entropy(logits, labels, reduction='none')
             weights = (1 - torch.softmax(logits, dim=1)[:, 0]) ** 2
-            loss = torch.sum(loss * weights) / torch.clamp(torch.sum(weights), min=1e-6)
+            loss = torch.mean(loss * weights)
         else:
             loss = F.cross_entropy(logits, labels)
         return loss
@@ -293,4 +293,9 @@ if __name__ == '__main__':
         trainer.fit(model, datamodule=reader_datamodule)
 
     if args.do_predict:
-        trainer.test(model, datamodule=reader_datamodule)
+        if args.do_train:
+            trainer.test(ckpt_path='best')
+        else:
+            model = ReaderModel.load_from_checkpoint(args.resume_from_checkpoint,
+                                                     encoder_name_or_path=args.model_name_or_path)
+            trainer.test(model, ckpt_path='best', verbose=True, datamodule=reader_datamodule)

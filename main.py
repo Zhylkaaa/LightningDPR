@@ -300,7 +300,7 @@ class DPRModel(pl.LightningModule):
     def setup(self, stage: Optional[str] = None) -> None:
         if stage != 'fit':
             return
-        train_loader = self.train_dataloader()
+        train_loader = self.trainer.datamodule.train_dataloader()
         trainer = self.trainer
         num_devices = max(1, trainer.gpus)
         effective_batch_size = self.hparams.train_batch_size * num_devices * trainer.accumulate_grad_batches

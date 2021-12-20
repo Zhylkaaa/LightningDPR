@@ -1,7 +1,7 @@
 import time
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from typing import Any, Tuple, Optional, Dict
+from typing import Any, Tuple, Optional, Dict, List
 import json
 
 import pytorch_lightning as pl
@@ -23,8 +23,6 @@ from dpr_model import DPRContextEncoder, DPRQuestionEncoder
 from utils import (
     init_dpr_component_from_pretrained_model
 )
-from fairscale.nn import checkpoint_wrapper, auto_wrap, wrap
-
 
 class SyncFunction(torch.autograd.Function):
 
@@ -107,6 +105,7 @@ class DPRModel(pl.LightningModule):
         self.save_hyperparameters(hparams)
 
         self.avg_train_num_correct = -1
+        self.avg_train_acc = 0
         self.avg_train_loss = 0
         self.output_dir = Path(self.hparams.output_dir)
         self.question_model_name_or_path = question_model_name_or_path
@@ -132,25 +131,6 @@ class DPRModel(pl.LightningModule):
         if self.hparams.cpu_checkpointing or self.hparams.partition_activations or self.hparams.use_checkpointing:
             self.q_encoder.gradient_checkpointing_enable(use_deepspeed=True)
             self.ctx_encoder.gradient_checkpointing_enable(use_deepspeed=True)
-
-    def configure_sharded_model(self) -> None:
-        if self.hparams.configure_sharded_model:
-            self.q_encoder, self.q_tokenizer = init_dpr_component_from_pretrained_model(
-                model_name_or_path=self.question_model_name_or_path,
-                component_class=DPRQuestionEncoder,
-                projection_dim=self.question_projection_dim,
-                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
-            )
-            self.q_encoder = auto_wrap(self.q_encoder)
-
-            self.ctx_encoder, self.ctx_tokenizer = init_dpr_component_from_pretrained_model(
-                model_name_or_path=self.context_model_name_or_path,
-                component_class=DPRContextEncoder,
-                projection_dim=self.context_projection_dim,
-                is_dpr_checkpoint=self.hparams.is_dpr_checkpoint
-            )
-
-            self.ctx_encoder = auto_wrap(self.ctx_encoder)
 
     def forward(self, question_input, ctx_input) -> Tuple[Tensor, Tensor]:
         local_question_vectors, local_ctx_vectors = \
@@ -213,7 +193,7 @@ class DPRModel(pl.LightningModule):
                 local_question_vectors, local_ctx_vectors[is_valid.type(torch.bool)], positive_context_ids
 
         loss, num_correct = self._calculate_loss(global_question_vectors, global_ctx_vectors, positive_context_ids)
-        return loss, num_correct
+        return loss, num_correct, len(positive_context_ids)
 
     def training_step(self, batch, batch_idx):
         question_input, ctx_input, positive_context_ids, is_valid = batch
@@ -225,13 +205,15 @@ class DPRModel(pl.LightningModule):
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
 
     def training_step_end(self, train_step_outputs):
-        loss, num_correct = self.shared_step(train_step_outputs, sync_grads=True)
+        loss, num_correct, total_examples = self.shared_step(train_step_outputs, sync_grads=True)
 
         if self.avg_train_num_correct == -1:
             self.avg_train_num_correct = num_correct
+            self.avg_train_acc = num_correct / total_examples
             self.avg_train_loss = loss
         else:
             self.avg_train_num_correct = 0.9 * self.avg_train_num_correct + 0.1 * num_correct
+            self.avg_train_acc = 0.9 * self.avg_train_acc + 0.1 * (num_correct / total_examples)
             self.avg_train_loss = 0.9 * self.avg_train_loss + 0.1 * loss
 
         if self.global_step % self.hparams.log_every_n_steps:
@@ -252,24 +234,26 @@ class DPRModel(pl.LightningModule):
         local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
 
-    def validation_step_end(self, validation_step_outputs) -> Tuple[Tensor, Tensor]:
-        loss, num_correct = self.shared_step(validation_step_outputs, sync_grads=False)
-        return loss, num_correct
+    def validation_step_end(self, validation_step_outputs) -> Tuple[Tensor, Tensor, int]:
+        loss, num_correct, total_examples = self.shared_step(validation_step_outputs, sync_grads=False)
+        return loss, num_correct, total_examples
 
-    def _aggregate_validation_metrics(self, outputs: Tuple[Tensor, Tensor]):
-        losses, num_correct = list(zip(*outputs))
+    def _aggregate_validation_metrics(self, outputs: List[Tuple[Tensor, Tensor]]):
+        losses, num_correct, total_examples = list(zip(*outputs))
         losses = torch.tensor(losses)
         num_correct = torch.tensor(num_correct)
+        total_examples = sum(total_examples)
 
         loss = torch.mean(losses).detach().cpu()
         num_correct = torch.sum(num_correct).detach().cpu()
-        return loss, num_correct
+        return loss, num_correct, total_examples
 
-    def validation_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
-        loss, num_correct = self._aggregate_validation_metrics(outputs)
+    def validation_epoch_end(self, outputs: List[Tuple[Tensor, Tensor]]) -> None:
+        loss, num_correct, total_examples = self._aggregate_validation_metrics(outputs)
 
         self.log('val_loss', loss)
         self.log('val_num_correct', num_correct)
+        self.log('val_acc', num_correct / total_examples)
         # self.log_dict({
         #     'val_loss': loss,
         #     'val_num_correct': num_correct
@@ -285,13 +269,14 @@ class DPRModel(pl.LightningModule):
         local_question_vetors, local_ctx_vectors = self(question_input, ctx_input)
         return local_question_vetors, local_ctx_vectors, positive_context_ids, is_valid
 
-    def test_step_end(self, test_step_outputs) -> Tuple[Tensor, Tensor]:
+    def test_step_end(self, test_step_outputs) -> Tuple[Tensor, Tensor, int]:
         return self.shared_step(test_step_outputs, sync_grads=False)
 
-    def test_epoch_end(self, outputs: Tuple[Tensor, Tensor]) -> None:
-        loss, num_correct = self._aggregate_validation_metrics(outputs)
+    def test_epoch_end(self, outputs: List[Tuple[Tensor, Tensor, int]]) -> None:
+        loss, num_correct, total_examples = self._aggregate_validation_metrics(outputs)
         self.log('test_loss', loss)
         self.log('test_num_correct', num_correct)
+        self.log('test_acc', num_correct / total_examples)
         # self.log_dict({
         #     'test_loss': loss,
         #     'test_num_correct': num_correct
